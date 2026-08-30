@@ -187,6 +187,16 @@ def init_db():
             criado_em TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alunos (
+            codigo TEXT PRIMARY KEY,
+            nome_completo TEXT,
+            turma TEXT,
+            observacoes TEXT,
+            ativo INTEGER DEFAULT 1,
+            criado_em TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -207,6 +217,40 @@ def insert_avaliacao(row: dict):
     conn.execute(f"INSERT INTO avaliacoes ({cols}) VALUES ({placeholders})", list(row.values()))
     conn.commit()
     conn.close()
+
+
+def insert_aluno(codigo: str, nome_completo: str, turma: str, observacoes: str = ""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO alunos (codigo, nome_completo, turma, observacoes, ativo, criado_em) VALUES (?, ?, ?, ?, 1, ?)",
+        (codigo, nome_completo, turma, observacoes, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_aluno_ativo(codigo: str, ativo: bool):
+    conn = get_conn()
+    conn.execute("UPDATE alunos SET ativo = ? WHERE codigo = ?", (1 if ativo else 0, codigo))
+    conn.commit()
+    conn.close()
+
+
+def sugerir_codigo(turma: str) -> str:
+    """Sugere o próximo código disponível para a turma, no formato TURMA-NN."""
+    if not turma:
+        return ""
+    prefixo = "".join(ch for ch in turma.upper() if ch.isalnum())
+    conn = get_conn()
+    existentes = pd.read_sql("SELECT codigo FROM alunos WHERE turma = ?", conn, params=(turma,))
+    conn.close()
+    numeros = []
+    for c in existentes["codigo"]:
+        partes = c.rsplit("-", 1)
+        if len(partes) == 2 and partes[1].isdigit():
+            numeros.append(int(partes[1]))
+    proximo = (max(numeros) + 1) if numeros else 1
+    return f"{prefixo}-{proximo:02d}"
 
 
 def load_df(table: str) -> pd.DataFrame:
@@ -236,7 +280,7 @@ init_db()
 st.sidebar.title("🔬 Lab Aberto de Física")
 pagina = st.sidebar.radio(
     "Navegar",
-    ["📝 Nova Observação", "📋 Nova Avaliação de Produção", "📊 Dashboard", "🗂️ Dados brutos"],
+    ["👤 Alunos", "📝 Nova Observação", "📋 Nova Avaliação de Produção", "📊 Dashboard", "🗂️ Dados brutos"],
 )
 
 st.sidebar.divider()
@@ -262,18 +306,92 @@ for key, default in {"last_turma": "", "last_atividade": "", "last_data": date.t
         st.session_state[key] = default
 
 # ------------------------------------------------------------------
+# Página: Alunos
+# ------------------------------------------------------------------
+if pagina == "👤 Alunos":
+    st.title("Cadastro de Alunos e Códigos")
+    st.caption("Associa o nome do aluno a um código anônimo, usado em todos os outros formulários e nas análises.")
+    st.warning(
+        "⚠️ **Esta tela — e os seletores de aluno nas telas de registro — mostram nomes reais.** "
+        "Conforme o projeto aprovado pelo CEP, os dados salvos (observações, avaliações, dashboard, "
+        "exportações) usam apenas o código, mas o nome aparece na tela enquanto você escolhe o aluno. "
+        "Evite deixar esta tela aberta em tela compartilhada, e restrinja quem pode acessar o app "
+        "(veja SETUP_DRIVE.md sobre configurar o app como privado no Streamlit Cloud)."
+    )
+
+    with st.form("form_aluno", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        nome_completo = c1.text_input("Nome completo do aluno")
+        turma_al = c2.text_input("Turma", placeholder="ex: 1A, 2B...")
+        c1, c2 = st.columns([1, 2])
+        sugestao = sugerir_codigo(turma_al) if turma_al else ""
+        codigo_al = c1.text_input("Código", value=sugestao, help="Gerado automaticamente a partir da turma. Pode editar se preferir outro padrão.")
+        obs_al = c2.text_input("Observações (opcional)", placeholder="ex: bolsista, transferido em...")
+        enviado_al = st.form_submit_button("Cadastrar aluno", use_container_width=True)
+
+        if enviado_al:
+            if not nome_completo or not turma_al or not codigo_al:
+                st.error("Preencha nome, turma e código.")
+            else:
+                try:
+                    insert_aluno(codigo_al.strip(), nome_completo.strip(), turma_al.strip(), obs_al.strip())
+                    if drive_enabled():
+                        upload_db_to_drive()
+                    st.success(f"Aluno cadastrado com código **{codigo_al}**.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error(f"Já existe um aluno com o código '{codigo_al}'. Escolha outro código.")
+
+    st.divider()
+    df_alunos = load_df("alunos")
+    if df_alunos.empty:
+        st.info("Nenhum aluno cadastrado ainda.")
+    else:
+        mostrar_nomes = st.checkbox("🔓 Mostrar nomes (dado sensível — oculto por padrão)")
+        turmas_al = sorted(df_alunos["turma"].dropna().unique())
+        filtro_turma = st.multiselect("Filtrar turma(s)", turmas_al, default=turmas_al)
+        df_show = df_alunos[df_alunos["turma"].isin(filtro_turma)].copy()
+        df_show["status"] = df_show["ativo"].map({1: "Ativo", 0: "Inativo"})
+        cols_visiveis = ["codigo", "turma", "status", "observacoes"]
+        if mostrar_nomes:
+            cols_visiveis.insert(1, "nome_completo")
+        st.dataframe(df_show[cols_visiveis], use_container_width=True, hide_index=True)
+
+        st.caption("Desativar um aluno (ex: transferência, desistência) sem apagar o histórico de dados já coletados:")
+        c1, c2 = st.columns([2, 1])
+        codigo_toggle = c1.selectbox("Código do aluno", df_alunos["codigo"])
+        novo_status = c2.selectbox("Novo status", ["Ativo", "Inativo"])
+        if st.button("Atualizar status"):
+            set_aluno_ativo(codigo_toggle, novo_status == "Ativo")
+            if drive_enabled():
+                upload_db_to_drive()
+            st.success("Status atualizado.")
+            st.rerun()
+
+# ------------------------------------------------------------------
 # Página: Nova Observação
 # ------------------------------------------------------------------
-if pagina == "📝 Nova Observação":
+elif pagina == "📝 Nova Observação":
     st.title("Ficha de Observação Estruturada")
     st.caption("Registro durante os encontros do laboratório — participação, interação, raciocínio científico e autonomia.")
+
+    df_alunos_obs = load_df("alunos")
 
     with st.form("form_observacao", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         data_obs = c1.date_input("Data", value=st.session_state.last_data)
         turma = c2.text_input("Turma", value=st.session_state.last_turma)
         atividade = c3.text_input("Atividade realizada", value=st.session_state.last_atividade)
-        grupo_codigo = st.text_input("Grupo/aluno (código) — opcional", placeholder="ex: G3 ou A-014")
+
+        ativos_obs = df_alunos_obs[df_alunos_obs["ativo"] == 1] if not df_alunos_obs.empty else df_alunos_obs
+        mapa_nomes_obs = dict(zip(ativos_obs["codigo"], ativos_obs["nome_completo"])) if not ativos_obs.empty else {}
+        opcoes_codigo = [""] + sorted(mapa_nomes_obs.keys())
+        codigo_sel = st.selectbox(
+            "Grupo/aluno (código) — opcional", opcoes_codigo,
+            format_func=lambda c: f"{mapa_nomes_obs[c]} — {c}" if c in mapa_nomes_obs else "(nenhum)",
+        )
+        codigo_livre = st.text_input("Ou digite um código de grupo (ex: G3), se não for um aluno cadastrado")
+        grupo_codigo = codigo_livre.strip() if codigo_livre.strip() else codigo_sel
 
         st.markdown("**1. Participação**")
         c1, c2 = st.columns(2)
@@ -333,7 +451,19 @@ elif pagina == "📋 Nova Avaliação de Produção":
     data_av = c1.date_input("Data", value=st.session_state.last_data, key="data_av")
     turma_av = c2.text_input("Turma", value=st.session_state.last_turma, key="turma_av")
     atividade_av = c3.text_input("Atividade", value=st.session_state.last_atividade, key="atividade_av")
-    aluno_codigo = st.text_input("Aluno (código)", placeholder="ex: A-014", key="aluno_codigo")
+
+    df_alunos_av = load_df("alunos")
+    ativos_av = df_alunos_av[df_alunos_av["ativo"] == 1] if not df_alunos_av.empty else df_alunos_av
+    mapa_nomes_av = dict(zip(ativos_av["codigo"], ativos_av["nome_completo"])) if not ativos_av.empty else {}
+    opcoes_al = sorted(mapa_nomes_av.keys())
+    if opcoes_al:
+        aluno_codigo = st.selectbox(
+            "Aluno (código)", opcoes_al, key="aluno_codigo_sel",
+            format_func=lambda c: f"{mapa_nomes_av[c]} — {c}",
+        )
+    else:
+        st.info("Nenhum aluno cadastrado ainda — cadastre em '👤 Alunos' ou digite o código manualmente abaixo.")
+        aluno_codigo = st.text_input("Aluno (código)", placeholder="ex: A-014", key="aluno_codigo")
 
     st.divider()
     valores = {}
