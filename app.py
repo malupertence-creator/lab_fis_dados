@@ -103,7 +103,11 @@ def _get_drive_service():
 
 def _find_drive_file_id(service, folder_id: str, filename: str):
     query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    results = service.files().list(
+        q=query, fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        corpora="allDrives",
+    ).execute()
     files = results.get("files", [])
     return files[0]["id"] if files else None
 
@@ -118,7 +122,7 @@ def download_db_from_drive() -> bool:
         file_id = _find_drive_file_id(service, folder_id, DB_PATH.name)
         if file_id is None:
             return False
-        request = service.files().get_media(fileId=file_id)
+        request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
         fh = io.FileIO(DB_PATH, "wb")
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -141,10 +145,10 @@ def upload_db_to_drive() -> bool:
         file_id = _find_drive_file_id(service, folder_id, DB_PATH.name)
         media = MediaIoBaseUpload(io.FileIO(DB_PATH, "rb"), mimetype="application/x-sqlite3", resumable=True)
         if file_id:
-            service.files().update(fileId=file_id, media_body=media).execute()
+            service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
         else:
             metadata = {"name": DB_PATH.name, "parents": [folder_id]}
-            service.files().create(body=metadata, media_body=media, fields="id").execute()
+            service.files().create(body=metadata, media_body=media, fields="id", supportsAllDrives=True).execute()
         st.session_state["last_sync"] = datetime.now()
         st.session_state["drive_error"] = None
         return True
